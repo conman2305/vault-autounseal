@@ -54,6 +54,7 @@ def init_vault(vault_instance_url):
             f"{vault_instance_url}/v1/sys/init",
             data=json.dumps(auto_unseal_payload),
             verify=False,  # nosec
+            timeout=5,
         )
         response = init_vault_request.json()
         return response
@@ -104,6 +105,7 @@ def vault_unseal(key, vault_instance_url):
             f"{vault_instance_url}/v1/sys/unseal",
             data=json.dumps(payload),
             verify=False,  # nosec
+            timeout=5,
         )
     except requests.exceptions.ConnectionError as unseal_error:
         logger.error("During unseal got error", unseal_error)
@@ -116,14 +118,16 @@ def vault_unseal(key, vault_instance_url):
 def get_seal_status(vault_instance_url, vault_status):
     try:
         get_seal = requests.get(
-            f"{vault_instance_url}/v1/sys/seal-status", verify=False  # nosec
+            f"{vault_instance_url}/v1/sys/seal-status", 
+            verify=False,  # nosec
+            timeout=5,
         )
         if not get_seal.json()["initialized"]:
             if vault_status:
                 logger.info(
                     "Vault has already been initialized, establishing quorum instead"
                 )
-                return status_init  # Return status_init to establish quorum
+                return status_quorum
 
             logger.info("Going to init and unseal Vault")
             try:
@@ -166,7 +170,9 @@ def get_quorum_established(quorum_established, replica_list, main_url):
                 continue
 
             leader_status = requests.get(
-                f"{vault_instance_url}/v1/sys/leader", verify=False  # nosec
+                f"{vault_instance_url}/v1/sys/leader", 
+                verify=False,  # nosec
+                timeout=5,
             )
 
             if "leader_address" not in leader_status.json():
@@ -196,7 +202,11 @@ def get_quorum_established(quorum_established, replica_list, main_url):
 
 def wait_for_quorum(replica_list, main_url):
     payload = {"leader_api_addr": main_url}
-    leader_status = requests.get(f"{main_url}/v1/sys/leader", verify=False)  # nosec
+    leader_status = requests.get(
+            f"{main_url}/v1/sys/leader", 
+            verify=False, # nosec
+            timeout=5,
+    )
     logger.info(
         "Leader http code {}, response json {}",
         leader_status.status_code,
@@ -212,13 +222,14 @@ def wait_for_quorum(replica_list, main_url):
                 f"{vault_instance_url}/v1/sys/storage/raft/join",
                 data=json.dumps(payload),
                 verify=False,  # nosec
+                timeout=5,
             )
 
         except requests.exceptions.ConnectionError as connection_error:
             logger.info("Unexpected error {}", connection_error)
             return status_error
 
-        logger.info("Unsealing {}", replica_url)
+        logger.info("Unsealing {}", vault_instance_url)
         read_secret(vault_keys, vault_instance_url)
 
     quorum_established = False
@@ -260,7 +271,49 @@ def get_vault_pods():
     logger.error("Waiting for Vault pods to be ready timed out. Will exit.")
     exit(2)
 
+def get_cluster_status(vault_replicas):
+    # Scan over all the replicas we discover. If we find any sealed instances,
+    #   then vault has already been initialized.
+    vault_initialized = False
 
+    for replica_url in vault_replicas:
+        try:
+            get_seal = requests.get(
+                f"{replica_url}/v1/sys/seal-status", 
+                verify=False,  # nosec
+                timeout=5,
+            )
+
+            if get_seal.json()["sealed"]:
+                vault_initialized = True
+                logger.info(f'{replica_url} reports status as sealed, cluster is already initialized')
+
+            if get_seal.json()["initialized"] and not get_seal.json()["sealed"]:
+                vault_initialized = True
+                logger.info(f'{replica_url} reports status as unsealed, cluster is already initialized')
+
+        except requests.exceptions.ConnectionError as seal_status_error:
+            logger.info("Unexpected status -> {}", seal_status_error)
+
+        return vault_initialized
+
+def get_node_leader(replica_url):
+    leader_status = requests.get(
+        f"{replica_url}/v1/sys/leader", 
+        verify=False,  # nosec
+        timeout=5,
+    )
+
+    if "leader_address" not in leader_status.json():
+        quorum_established = False
+        logger.info(
+            "Vault node {} is not ready: {} ", replica_url, leader_status.json()
+        )
+        
+        return ""
+
+    return leader_status.json()["leader_address"]
+ 
 if __name__ == "__main__":
 
     vault_initialized = False
@@ -309,8 +362,10 @@ if __name__ == "__main__":
     k8s_secret = k8s_client.V1Secret()
     status_init = 0
     status_unseal = 1
-    status_ok = 2
-    status_error = 3
+    status_quorum = 2
+    status_ok = 3
+    status_error = 4
+
     auto_unseal_payload = {
         "secret_shares": int(secret_shares),
         "secret_threshold": int(secret_threshold),
@@ -324,56 +379,53 @@ if __name__ == "__main__":
 
     while True:
         logger.info("Begin scan cycle")
-        # When running multiple vault instances, the DNS query will return multiple IPs.
-        # We want to iterate over each of those IPs to ensure each replica is unsealed.
-
-        # getaddrinfo() returns a 5-touple of (family, type, proto, canonname, sockaddr)
-        # Index 4 (sockaddr) is a touple of (ip_addr, port), so we're extracting
-        # index 4 (the ip addr touple) and then indexing into that touple to get the
-        # actual ip address (index 0) and the port (index 1).
-
-        # Then use list comprehension to return a list of "http://{ip_addr}:{port}" to
-        # iterate over
-        try:
-            vault_replicas = sorted(
-                [
-                    f"{url.scheme}://{x[4][0]}:{x[4][1]}"
-                    for x in socket.getaddrinfo(
-                    vault_hostname, vault_port, proto=socket.IPPROTO_TCP
-                )
-                ]
-            )
-        except socket.gaierror as err:
-            logger.error("Failed to lookup DNS info: {}", err)
-            sleep(5)
-            continue
-        vault_replicas.clear()
-
+        vault_replicas = []
         pods = get_vault_pods()
+
         for pod in pods.items:
             vault_replicas.append(f"{url.scheme}://{pod.status.pod_ip}:{vault_port}")
+        
         logger.info("Discovered Vault instance(s): {}", vault_replicas)
+
+        vault_initialized = get_cluster_status(vault_replicas)
+        
         for replica_url in vault_replicas:
             status = get_seal_status(replica_url, vault_initialized)
+
             if status == status_init:
                 if len(vault_replicas) > 1:
                     logger.info(
                         "Vault running in High Availability mode will unseal Vault nodes one by one"
                     )
                 else:
-                    logger.info("Vault running in Singe Node mode will unseal")
-                # Only set the Leader URL once
+                    logger.info("Vault running in Single Node mode will unseal")
+
+                # If Vault has not been initialized, then this replica becomes the leader
                 if not vault_initialized:
-                    vault_initialized = True
                     leader_url = replica_url
+                    logger.info(f'Vault leader set to {replica_url}')
+    
                 logger.info(
                     "Vault was just initialized, waiting for quorum to be established"
                 )
+
                 wait_for_quorum(vault_replicas, leader_url)
+            
+            if status == status_quorum:
+                if len(leader_url) > 0:
+                    wait_for_quorum(vault_replicas, leader_url)
+                else:
+                    logger.info("Leader URL has not been discovered yet, cannot establish quorum")
 
             if status == status_unseal:
-                # If we've unsealed an instance, then by definition vault has been initialized
-                vault_initialized = True
-                logger.info("Vault has been unsealed")
+                if not len(leader_url) > 0:
+                    leader_url = get_node_leader(replica_url)
+                    logger.info(f'Leader according to {replica_url} is {leader_url}')
 
+            if status == status_ok:
+                node_leader_url = get_node_leader(replica_url)
+                if node_leader_url != leader_url:
+                    leader_url = node_leader_url
+                    logger.info(f'Leader has changed to {leader_url} according to {replica_url}')
+                    
         sleep(scan_delay)
